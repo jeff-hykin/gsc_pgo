@@ -366,7 +366,11 @@ int main(int argc, char** argv)
     std::string odom_topic = native_module.topic("odometry");
     std::string corrected_odom_topic = native_module.topic("corrected_odometry");
     std::string correction_topic = native_module.topic("correction");
-    std::string global_map_topic = native_module.topic("_global_map");
+    // Optional/debug port: the leading underscore keeps autoconnect from wiring
+    // it, so a consumer (e.g. the eval harness) often leaves it unconnected.
+    // Only resolve a topic when one was actually provided.
+    std::string global_map_topic =
+        native_module.has("_global_map") ? native_module.topic("_global_map") : "";
     std::string pose_graph_topic = native_module.topic("pose_graph");
     std::string loop_closure_event_topic = native_module.topic("loop_closure_event");
 
@@ -429,7 +433,7 @@ int main(int argc, char** argv)
     // port so it never autoconnects to a consumer's `global_map` In — terrain_mapper
     // is the planner's single authoritative global_map. It's a big cloud that can
     // overflow LCM's single-message limit and congest the bus; enable only for debug.
-    bool publish_global_map = global_map_publish_rate > 0;
+    bool publish_global_map = global_map_publish_rate > 0 && !global_map_topic.empty();
     double global_map_interval = publish_global_map ? 1.0 / global_map_publish_rate : 0.0;
 
     // Unregister mode: transform world-frame scans to body-frame
