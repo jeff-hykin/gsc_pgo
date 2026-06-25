@@ -49,25 +49,28 @@ target_link_directories(pgo PRIVATE
 
 install(TARGETS pgo DESTINATION bin)
 
-# Lockstep unit test for the landmark / gravity-anchor / replacement paths.
-# No LCM needed — it links the PGO sources and drives SimplePGO directly.
-add_executable(pgo_landmark_test
-  pgo_landmark_test.cpp
+# Lockstep unit test for the location-constraint / gravity-anchor / revision
+# paths. It links the PGO sources and drives SimplePGO directly (no LCM runtime),
+# but still needs the generated message headers (simple_pgo.h pulls in PoseStamped).
+add_executable(pgo_location_constraint_test
+  pgo_location_constraint_test.cpp
   simple_pgo.cpp
   scan_context.cpp
   commons.cpp
 )
 
-target_include_directories(pgo_landmark_test PRIVATE
+target_include_directories(pgo_location_constraint_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
+  ${dimos_lcm_SOURCE_DIR}/generated/cpp_lcm_msgs
+  ${LCM_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}
   ${GTSAM_INCLUDE_DIR}
 )
 
-target_link_libraries(pgo_landmark_test PRIVATE
+target_link_libraries(pgo_location_constraint_test PRIVATE
   ${PCL_LIBRARIES}
   gtsam
 )
 
-install(TARGETS pgo_landmark_test DESTINATION bin)
+install(TARGETS pgo_location_constraint_test DESTINATION bin)

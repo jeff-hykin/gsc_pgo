@@ -22,7 +22,7 @@
 #include "dimos_native_module.hpp"
 #include "msgs/Graph3D.hpp"
 #include "msgs/GraphDelta3D.hpp"
-#include "msgs/Landmark.hpp"
+#include "msgs/LocationConstraint.hpp"
 #include "point_cloud_utils.hpp"
 
 #include "nav_msgs/Odometry.hpp"
@@ -49,64 +49,68 @@ static double g_last_message_time = 0.0;
 // falls behind has bounded latency/memory instead of an unbounded backlog.
 static std::atomic<int> g_max_scan_queue{0};
 
-// Latest odometry for non-keyframe TF broadcasting
+// Latest odometry for non-keyframe TF broadcasting.
 static std::mutex g_odom_mutex;
 static M3D g_latest_r = M3D::Identity();
 static V3D g_latest_t = V3D::Zero();
 static double g_latest_time = 0.0;
 static bool g_has_odom = false;
+static std::string g_latest_odom_frame = "odom";  // odometry header.frame_id
 
-// --- Static-frame resolution --------------------------------------------------
-// A Landmark event's pose is in its own frame_id (typically a camera frame). We
-// resolve that frame to the robot body via the *static* TF tree (/tf_static) —
-// the fixed camera mount. Frames that only exist on the dynamic /tf tree (map,
-// odom) won't resolve, which is exactly right: their pose already has odometry
-// drift baked in and is useless for correcting drift.
-struct Tf { M3D r = M3D::Identity(); V3D t = V3D::Zero(); };  // p_out = r*p_in + t
-static Tf tf_compose(const Tf& a, const Tf& b) { return {a.r * b.r, a.r * b.t + a.t}; }
-static Tf tf_inverse(const Tf& a) { M3D ri = a.r.transpose(); return {ri, -ri * a.t}; }
-
-// --- Landmark-event state ------------------------------------------------------
-// Decoupled Landmark events (a separate perceiver emits them). A Landmark's pose
-// is the landmark in its header frame_id (a camera frame); we resolve that frame
-// to the body via /tf_static, compose landmark-in-body, and buffer it for
-// time-association to a keyframe. The detection + noise/confidence filtering
-// happen upstream in the perceiver.
-static std::mutex g_landmark_mutex;
-static std::deque<LandmarkObs> g_landmark_buffer;
-static bool g_use_landmarks = false;
-static double g_landmark_assoc_max_dt = 0.2;    // s: max |lm_ts - keyframe_ts|
-static double g_landmark_buffer_window = 3.0;   // s: how long to retain landmarks
-
-// Static TF tree: frame -> [(neighbor, T_neighbor_frame)], built from /tf_static.
-static std::mutex g_tf_mutex;
-static std::map<std::string, std::vector<std::pair<std::string, Tf>>> g_static_tf;
+// Robot body frame; LocationConstraints are enforced to be expressed in it.
 static std::string g_body_frame = "base_link";
 
-// Resolve T_target_source (p_target = T * p_source) over the static tree. BFS;
-// returns false if no static path exists (e.g. source is a dynamic map/odom
-// frame, or no /tf_static received yet).
-static bool resolve_static_tf(const std::string& target, const std::string& source, Tf& out) {
-    if (source == target) { out = Tf{}; return true; }
-    std::lock_guard<std::mutex> lock(g_tf_mutex);
-    std::map<std::string, Tf> dist;
-    dist[source] = Tf{};
-    std::queue<std::string> q;
-    q.push(source);
-    while (!q.empty()) {
-        std::string n = q.front();
-        q.pop();
-        auto it = g_static_tf.find(n);
-        if (it == g_static_tf.end()) continue;
-        for (const auto& [m, t_m_n] : it->second) {
-            if (dist.count(m)) continue;
-            dist[m] = tf_compose(t_m_n, dist[n]);  // T_m_source = T_m_n . T_n_source
-            if (m == target) { out = dist[m]; return true; }
-            q.push(m);
-        }
+// --- Odometry sliding buffer --------------------------------------------------
+// A bounded history of recent odometry so a LocationConstraint can be placed at
+// its OWN timestamp via interpolation, not at whatever odom arrived last —
+// perception/UI latency means the constraint's pose is in the past.
+struct OdomSample { double ts; M3D r; V3D t; std::string frame_id; };
+static std::mutex g_odom_buffer_mutex;
+static std::deque<OdomSample> g_odom_buffer;
+static double g_odom_buffer_window = 10.0;  // s of history to retain (configurable)
+
+// Interpolate the odometry pose at `ts` (slerp rotation, lerp translation).
+// Returns false if the buffer is empty or `ts` predates it (constraint older than
+// our history -> can't place it). `ts` past the latest sample clamps to latest.
+static bool interpolate_odom(double ts, M3D& r_out, V3D& t_out, std::string& frame_out) {
+    std::lock_guard<std::mutex> lock(g_odom_buffer_mutex);
+    if (g_odom_buffer.empty())
+        return false;
+    if (ts <= g_odom_buffer.front().ts) {
+        // Only accept a tiny boundary underflow; older than our history -> reject.
+        if (g_odom_buffer.front().ts - ts > 1e-3)
+            return false;
+        const OdomSample& s = g_odom_buffer.front();
+        r_out = s.r; t_out = s.t; frame_out = s.frame_id;
+        return true;
+    }
+    if (ts >= g_odom_buffer.back().ts) {
+        const OdomSample& s = g_odom_buffer.back();
+        r_out = s.r; t_out = s.t; frame_out = s.frame_id;
+        return true;
+    }
+    for (size_t i = 1; i < g_odom_buffer.size(); i++) {
+        const OdomSample& hi = g_odom_buffer[i];
+        if (hi.ts < ts) continue;
+        const OdomSample& lo = g_odom_buffer[i - 1];
+        double span = hi.ts - lo.ts;
+        double alpha = span > 0.0 ? (ts - lo.ts) / span : 0.0;
+        t_out = lo.t + alpha * (hi.t - lo.t);
+        r_out = Eigen::Quaterniond(lo.r).slerp(alpha, Eigen::Quaterniond(hi.r)).toRotationMatrix();
+        frame_out = lo.frame_id;
+        return true;
     }
     return false;
 }
+
+// --- Location-constraint state ------------------------------------------------
+// Decoupled LocationConstraint events (a separate perceiver emits them). Each
+// carries a body->location relative pose + 6x6 covariance, already in the body
+// frame (enforced below). Buffered here and drained in the main loop, where each
+// becomes its own pose node + BetweenFactor.
+static std::mutex g_location_constraint_mutex;
+static std::deque<LocationConstraintObs> g_location_constraint_buffer;
+static bool g_use_location_constraints = false;
 
 class Handlers {
 public:
@@ -125,11 +129,23 @@ public:
 
         double ts = msg->header.stamp.sec + msg->header.stamp.nsec / 1e9;
 
-        std::lock_guard<std::mutex> lock(g_odom_mutex);
-        g_latest_r = r;
-        g_latest_t = t;
-        g_latest_time = ts;
-        g_has_odom = true;
+        {
+            std::lock_guard<std::mutex> lock(g_odom_mutex);
+            g_latest_r = r;
+            g_latest_t = t;
+            g_latest_time = ts;
+            g_latest_odom_frame = msg->header.frame_id;
+            g_has_odom = true;
+        }
+
+        // Append to the sliding buffer (for interpolating a constraint's pose at
+        // its own timestamp) and trim entries older than the retention window.
+        std::lock_guard<std::mutex> buf_lock(g_odom_buffer_mutex);
+        g_odom_buffer.push_back({ts, r, t, msg->header.frame_id});
+        while (!g_odom_buffer.empty() &&
+               ts - g_odom_buffer.front().ts > g_odom_buffer_window) {
+            g_odom_buffer.pop_front();
+        }
     }
 
     void on_registered_scan(const lcm::ReceiveBuffer*, const std::string&,
@@ -148,6 +164,7 @@ public:
         CloudWithPose cloud_with_pose;
         cloud_with_pose.pose.r = g_latest_r;
         cloud_with_pose.pose.t = g_latest_t;
+        cloud_with_pose.frame_id = g_latest_odom_frame;  // the frame this pose is in
         cloud_with_pose.pose.setTime(static_cast<int32_t>(ts),
                         static_cast<uint32_t>((ts - static_cast<int32_t>(ts)) * 1e9));
 
@@ -163,92 +180,46 @@ public:
         }
     }
 
-    // Accumulate the static TF tree from /tf_static.
-    void on_static_tf(const lcm::ReceiveBuffer*, const std::string&,
-                      const tf2_msgs::TFMessage* msg) {
-        std::lock_guard<std::mutex> lock(g_tf_mutex);
-        for (const auto& ts : msg->transforms) {
-            const std::string& parent = ts.header.frame_id;
-            const std::string& child = ts.child_frame_id;
-            Tf t_parent_child;
-            t_parent_child.r = Eigen::Quaterniond(
-                ts.transform.rotation.w, ts.transform.rotation.x,
-                ts.transform.rotation.y, ts.transform.rotation.z).toRotationMatrix();
-            t_parent_child.t = V3D(ts.transform.translation.x,
-                                   ts.transform.translation.y,
-                                   ts.transform.translation.z);
-            g_static_tf[child].push_back({parent, t_parent_child});
-            g_static_tf[parent].push_back({child, tf_inverse(t_parent_child)});
-        }
-    }
-
-    // A decoupled Landmark event. Its pose is the landmark in header.frame_id (a
-    // camera frame); resolve that to the body via /tf_static, compose
-    // landmark-in-body, and buffer it for time-association to a keyframe.
-    void on_landmark(const lcm::ReceiveBuffer*, const std::string&,
-                     const jnav::Landmark* msg) {
-        if (!g_use_landmarks)
+    // A decoupled LocationConstraint event: a body->location relative pose +
+    // 6x6 covariance, ready for a BetweenFactor. We enforce frame_id == the body
+    // frame for now (no full C++ tf yet); a constraint in any other frame is
+    // dropped.
+    // TODO: when a real tf system lands, resolve an arbitrary frame_id to the
+    // body frame here (and auto-add the intermediate nodes/transforms) instead of
+    // rejecting it.
+    void on_location_constraint(const lcm::ReceiveBuffer*, const std::string&,
+                                const jnav::LocationConstraint* msg) {
+        if (!g_use_location_constraints)
             return;
         const std::string& frame_id =
             !msg->frame_id.empty() ? msg->frame_id : g_body_frame;
-        Tf t_body_frame;
-        if (!resolve_static_tf(g_body_frame, frame_id, t_body_frame)) {
-            if (g_tf_warned.insert(frame_id).second)
+        if (frame_id != g_body_frame) {
+            if (m_frame_warned.insert(frame_id).second)
                 fprintf(stderr,
-                        "PGO: landmark frame '%s' has no static path to '%s' "
-                        "(dynamic/map frame?); skipping its landmarks\n",
+                        "PGO: LocationConstraint frame '%s' != body frame '%s'; "
+                        "dropping (only body-frame constraints supported for now)\n",
                         frame_id.c_str(), g_body_frame.c_str());
             return;
         }
-        Tf t_frame_lm;
-        t_frame_lm.r = Eigen::Quaterniond(
+
+        LocationConstraintObs obs;
+        obs.to_id = msg->to_id;
+        obs.constraint_instance_id = msg->constraint_instance_id;
+        obs.r_body_loc = Eigen::Quaterniond(
             msg->quat_w, msg->quat_x, msg->quat_y, msg->quat_z).toRotationMatrix();
-        t_frame_lm.t = V3D(msg->pos_x, msg->pos_y, msg->pos_z);
-        Tf t_body_lm = tf_compose(t_body_frame, t_frame_lm);
-
-        LandmarkObs obs;
-        obs.id = msg->id;
-        obs.r_body_lm = t_body_lm.r;
-        obs.t_body_lm = t_body_lm.t;
+        obs.t_body_loc = V3D(msg->pos_x, msg->pos_y, msg->pos_z);
+        for (int row = 0; row < 6; row++)
+            for (int col = 0; col < 6; col++)
+                obs.covariance(row, col) = msg->covariance[row * 6 + col];
         obs.ts = msg->ts;
-        obs.confidence = msg->confidence;
-        obs.replacement_ms = msg->replacement;
 
-        std::lock_guard<std::mutex> lock(g_landmark_mutex);
-        g_landmark_buffer.push_back(std::move(obs));
-        while (!g_landmark_buffer.empty() &&
-               msg->ts - g_landmark_buffer.front().ts > g_landmark_buffer_window) {
-            g_landmark_buffer.pop_front();
-        }
+        std::lock_guard<std::mutex> lock(g_location_constraint_mutex);
+        g_location_constraint_buffer.push_back(std::move(obs));
     }
 
 private:
-    std::set<std::string> g_tf_warned;  // frames already warned about (once each)
+    std::set<std::string> m_frame_warned;  // frames already warned about (once each)
 };
-
-// Landmark observations to associate with a keyframe: for each landmark id, the
-// buffered sighting closest to the keyframe time within g_landmark_assoc_max_dt.
-// This does not consume the buffer (the buffer window expires stale entries);
-// addKeyPose only stores these if the scan becomes a keyframe.
-static std::vector<LandmarkObs> landmarks_near(double keyframe_ts) {
-    std::lock_guard<std::mutex> lock(g_landmark_mutex);
-    std::map<std::string, size_t> best_idx;
-    std::map<std::string, double> best_dt;
-    for (size_t i = 0; i < g_landmark_buffer.size(); i++) {
-        double dt = std::abs(g_landmark_buffer[i].ts - keyframe_ts);
-        if (dt > g_landmark_assoc_max_dt)
-            continue;
-        auto it = best_dt.find(g_landmark_buffer[i].id);
-        if (it == best_dt.end() || dt < it->second) {
-            best_dt[g_landmark_buffer[i].id] = dt;
-            best_idx[g_landmark_buffer[i].id] = i;
-        }
-    }
-    std::vector<LandmarkObs> out;
-    for (const auto& [id, idx] : best_idx)
-        out.push_back(g_landmark_buffer[idx]);
-    return out;
-}
 
 static geometry_msgs::TransformStamped build_tf(const M3D& r, const V3D& t, double ts,
                                                   const std::string& frame_id,
@@ -425,15 +396,12 @@ int main(int argc, char** argv)
     config.loop_robust_kernel = native_module.arg_bool("loop_robust_kernel", false);
     config.loop_robust_huber_k = native_module.arg_float("loop_robust_huber_k", 1.345f);
 
-    // Landmark events (decoupled perceiver -> PGO factor-graph manager).
-    config.use_landmarks = native_module.arg_bool("use_landmarks", false);
-    config.landmark_var_inplane_trans_m2 = native_module.arg_float("landmark_var_inplane_trans_m2", 0.0025f);
-    config.landmark_var_range_trans_m2 = native_module.arg_float("landmark_var_range_trans_m2", 0.25f);
-    config.landmark_var_yaw_rot_rad2 = native_module.arg_float("landmark_var_yaw_rot_rad2", 0.0025f);
-    config.landmark_var_outplane_rot_rad2 = native_module.arg_float("landmark_var_outplane_rot_rad2", 0.04f);
-    g_use_landmarks = config.use_landmarks;
-    g_landmark_assoc_max_dt = native_module.arg_float("landmark_assoc_max_dt", 0.2f);
-    g_landmark_buffer_window = native_module.arg_float("landmark_buffer_window", 3.0f);
+    // Location constraints (decoupled perceiver -> PGO factor-graph manager).
+    // Each becomes its own pose node + a BetweenFactor whose noise model is the
+    // covariance carried in the message (no per-axis config knobs).
+    config.use_location_constraints = native_module.arg_bool("use_location_constraints", false);
+    g_use_location_constraints = config.use_location_constraints;
+    g_odom_buffer_window = native_module.arg_float("odom_buffer_window", 10.0f);
 
     // Gravity anchor (fix the gravity-aligned initial roll/pitch on keyframe 0).
     config.gravity_anchor = native_module.arg_bool("gravity_anchor", true);
@@ -454,7 +422,7 @@ int main(int argc, char** argv)
     std::string frame_id = native_module.arg("frame_id", "map");
     std::string child_frame_id = native_module.arg("child_frame_id", "odom");
     std::string body_frame = native_module.arg("body_frame", "base_link");
-    g_body_frame = body_frame;  // target frame for landmark-frame TF resolution
+    g_body_frame = body_frame;  // frame a LocationConstraint must be expressed in
     float global_map_voxel_size = native_module.arg_float("global_map_voxel_size", 0.1f);
     float global_map_publish_rate = native_module.arg_float("global_map_publish_rate", 0.0f);
     // OFF by default (rate <= 0 disables it). Published on the internal `_global_map`
@@ -488,16 +456,9 @@ int main(int argc, char** argv)
     Handlers handlers;
     lcm.subscribe(odom_topic, &Handlers::on_odometry, &handlers);
     lcm.subscribe(scan_topic, &Handlers::on_registered_scan, &handlers);
-    if (g_use_landmarks && native_module.has("landmarks")) {
-        lcm.subscribe(native_module.topic("landmarks"),
-                      &Handlers::on_landmark, &handlers);
-    }
-    // The fixed camera mount (landmark frame -> body) lives on the static tree;
-    // subscribe once if landmark ingestion needs it.
-    if (g_use_landmarks) {
-        std::string tf_static_channel =
-            native_module.arg("tf_static_channel", "/tf_static#tf2_msgs.TFMessage");
-        lcm.subscribe(tf_static_channel, &Handlers::on_static_tf, &handlers);
+    if (g_use_location_constraints && native_module.has("location_constraints")) {
+        lcm.subscribe(native_module.topic("location_constraints"),
+                      &Handlers::on_location_constraint, &handlers);
     }
 
     // NativeModule.start() in Python reads stderr for this marker and only
@@ -523,6 +484,45 @@ int main(int argc, char** argv)
     while (g_running.load()) {
         // Drain all pending LCM messages
         while (lcm.handleTimeout(0) > 0) {}
+
+        // Drain pending LocationConstraints. Each becomes its own pose node
+        // (placed via interpolated odometry at the constraint's timestamp) plus a
+        // BetweenFactor. Done here, before and independent of the scan step, so a
+        // constraint is handled promptly even when no scans are arriving.
+        if (g_use_location_constraints) {
+            std::vector<LocationConstraintObs> pending;
+            {
+                std::lock_guard<std::mutex> lock(g_location_constraint_mutex);
+                pending.assign(g_location_constraint_buffer.begin(),
+                               g_location_constraint_buffer.end());
+                g_location_constraint_buffer.clear();
+            }
+            for (const auto& constraint : pending) {
+                M3D interp_r;
+                V3D interp_t;
+                std::string interp_frame;
+                if (!interpolate_odom(constraint.ts, interp_r, interp_t, interp_frame)) {
+                    fprintf(stderr,
+                            "PGO: no odometry within the buffer window for constraint "
+                            "to_id=%s ts=%.3f; dropping\n",
+                            constraint.to_id.c_str(), constraint.ts);
+                    continue;
+                }
+                PoseWithTime node_pose;
+                node_pose.r = interp_r;
+                node_pose.t = interp_t;
+                node_pose.setTime(
+                    static_cast<int32_t>(constraint.ts),
+                    static_cast<uint32_t>((constraint.ts - static_cast<int32_t>(constraint.ts)) * 1e9));
+                if (pgo.addLocationConstraint(node_pose, interp_frame, constraint))
+                    pgo.smoothAndUpdate();
+                else
+                    fprintf(stderr,
+                            "PGO: LocationConstraint to_id=%s arrived before any keyframe; "
+                            "dropping (no node to anchor from)\n",
+                            constraint.to_id.c_str());
+            }
+        }
 
         // Strict FIFO: process one scan per tick. The backlog is bounded at
         // enqueue time by g_max_scan_queue (oldest dropped when full).
@@ -561,12 +561,6 @@ int main(int argc, char** argv)
         }
 
         double cur_time = cloud_with_pose.pose.second;
-
-        // Attach the landmark events nearest this scan's time (no-op if off or
-        // none in the association window). addKeyPose stores them only if this
-        // scan becomes a keyframe.
-        if (g_use_landmarks)
-            cloud_with_pose.landmark_obs = landmarks_near(cur_time);
 
         if (!pgo.addKeyPose(cloud_with_pose)) {
             // Not a keyframe — still broadcast TF and corrected odom

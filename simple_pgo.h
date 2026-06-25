@@ -14,9 +14,11 @@
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/linear/NoiseModel.h>
+#include "geometry_msgs/PoseStamped.hpp"
+#include <map>
 #include <string>
 
-// LandmarkObs lives in commons.h (shared with CloudWithPose).
+// LocationConstraintObs lives in commons.h (shared with CloudWithPose).
 
 struct KeyPoseWithCloud
 {
@@ -26,8 +28,6 @@ struct KeyPoseWithCloud
     V3D t_global;
     double time;
     CloudType::Ptr body_cloud;
-    // Landmark events associated with this keyframe (use_landmarks path).
-    std::vector<LandmarkObs> landmark_obs;
 };
 struct LoopPair
 {
@@ -86,21 +86,14 @@ struct Config
     bool loop_robust_kernel = false;
     double loop_robust_huber_k = 1.345;
 
-    // --- Landmark events (decoupled Landmark-event ingestion) ----------------
-    // When true, the PGO ingests Landmark events (a separate perceiver emits
-    // them) and attaches each as a graph landmark variable + an observation
-    // BetweenFactor(keyframe, landmark). Two sightings of the same landmark id
-    // share the variable -> GTSAM closes the loop automatically. Off by default
-    // so the module behaves exactly as before unless asked for.
-    bool use_landmarks = false;
-    // Measurement noise for a landmark observation (body<-landmark relative
-    // pose), built anisotropically in the landmark frame then rotated into the
-    // body frame (in-plane + yaw well observed, range + out-of-plane tilt
-    // loose). Variances.
-    double landmark_var_inplane_trans_m2 = 0.0025;  // (5 cm)^2
-    double landmark_var_range_trans_m2 = 0.25;      // (50 cm)^2 along normal
-    double landmark_var_yaw_rot_rad2 = 0.0025;      // (~2.9 deg)^2
-    double landmark_var_outplane_rot_rad2 = 0.04;   // (~11 deg)^2
+    // --- Location constraints (decoupled constraint-event ingestion) ---------
+    // When true, the PGO ingests LocationConstraint events (a separate perceiver
+    // emits them). Each becomes its own pose node (placed from interpolated
+    // odometry at the constraint's timestamp) plus a BetweenFactor(node,
+    // location) whose noise model is the covariance carried in the message. Two
+    // constraints sharing a to_id observe the same graph variable -> GTSAM
+    // closes the loop automatically. Off by default.
+    bool use_location_constraints = false;
 
     // --- Odometry between-factor noise (anisotropic) -------------------------
     // The LIO front end's *relative* roll/pitch between consecutive keyframes is
@@ -163,6 +156,14 @@ public:
 
     bool addKeyPose(const CloudWithPose &cloud_with_pose);
 
+    // Ingest a LocationConstraint. Adds its own pose node at `pose` (the caller
+    // interpolates odometry at the constraint's timestamp; `frame_id` is that
+    // odometry's frame) linked to the backbone by an odom between-factor, then a
+    // BetweenFactor(node, location) using the constraint's covariance. Returns
+    // false (and does nothing) if no keyframe exists yet to anchor from.
+    bool addLocationConstraint(const PoseWithTime &pose, const std::string &frame_id,
+                               const LocationConstraintObs &constraint);
+
     bool hasLoop(){return m_cache_pairs.size() > 0;}
 
     void searchForLoopPairs();
@@ -175,6 +176,12 @@ public:
 
     M3D offsetR() { return m_r_offset; }
     V3D offsetT() { return m_t_offset; }
+
+    // Parallel to GTSAM's Values (key -> Pose3): our key -> PoseStamped, carrying
+    // the frame_id each node's pose was created in (from the odometry). GTSAM
+    // nodes have no frame; this is where we keep that bookkeeping. (Not consumed
+    // yet — scaffolding for future automatic cross-frame node additions.)
+    const std::map<gtsam::Key, geometry_msgs::PoseStamped> &nodePoses() const { return m_node_poses; }
 
     // Place recognition exposed for diagnostics / persistence.
     const std::vector<scan_context::Descriptor>& descriptors() const { return m_scan_context_descriptors; }
@@ -189,13 +196,21 @@ private:
     // positions). Kept for ablation + when scan context is disabled.
     int searchByPosition() const;
 
-    // Landmark-event factors for the newest keyframe: for each LandmarkObs it
-    // carries, ensure a graph variable for that landmark id exists (initialized
-    // from this keyframe's global pose), add a BetweenFactor(keyframe, landmark),
-    // and apply `replacement` by scheduling removal of superseded same-id
-    // factors. Records each new landmark factor's graph position so its iSAM2
-    // factor index can be captured after the update (for later removal).
-    void addLandmarkFactors(size_t keyframe_idx);
+    // Insert a new pose node (key = next contiguous index) at `pose`: initial
+    // value + a backbone factor (gravity prior on the first, else an odom
+    // between-factor to the previous node), the optional per-keyframe gravity
+    // anchor, the scan-context cache (empty when cloud is null), and the
+    // key -> PoseStamped frame record. Returns the new node's index.
+    size_t insertPoseNode(const PoseWithTime &pose, CloudType::Ptr cloud,
+                          const std::string &frame_id);
+
+    // Constraint factor for a freshly-inserted node: ensure a graph variable for
+    // to_id exists (initialized from this node's global pose), add a
+    // BetweenFactor(node, location) with the constraint's covariance, and apply
+    // constraint_instance_id revision by scheduling removal of any committed
+    // factors with the same instance id. Stages the new factor's graph position
+    // so its iSAM2 factor index can be captured after the update.
+    void addLocationConstraintFactors(size_t node_idx, const LocationConstraintObs &constraint);
 
     Config m_config;
     scan_context::Config m_scan_context_config;
@@ -211,21 +226,24 @@ private:
     gtsam::NonlinearFactorGraph m_graph;
     pcl::IterativeClosestPoint<PointType, PointType> m_icp;
 
-    // --- Landmark-event bookkeeping ------------------------------------------
-    // id -> the landmark's variable index (gtsam key = Symbol('l', index)).
-    std::map<std::string, int> m_landmark_index;
-    int m_next_landmark = 0;
-    // A landmark observation factor staged this update cycle, with its position
-    // in m_graph so its assigned iSAM2 factor index can be captured afterwards.
-    struct StagedLandmarkFactor { std::string id; double ts; size_t graph_pos; };
-    std::vector<StagedLandmarkFactor> m_staged_landmark_factors;
-    // id -> committed (ts, iSAM2 factor index) observation factors, for removal
-    // when a corrective Landmark supersedes them via `replacement`.
-    std::map<std::string, std::vector<std::pair<double, size_t>>> m_committed_landmarks;
-    // Factor indices to remove on the next iSAM2 update (replacement).
+    // key -> PoseStamped (frame bookkeeping; see nodePoses()).
+    std::map<gtsam::Key, geometry_msgs::PoseStamped> m_node_poses;
+
+    // --- Location-constraint bookkeeping -------------------------------------
+    // to_id -> the location's variable index (gtsam key = Symbol('l', index)).
+    std::map<std::string, int> m_location_index;
+    int m_next_location = 0;
+    // A constraint factor staged this update cycle, with its position in m_graph
+    // so its assigned iSAM2 factor index can be captured afterwards.
+    struct StagedConstraintFactor { std::string instance_id; size_t graph_pos; };
+    std::vector<StagedConstraintFactor> m_staged_constraint_factors;
+    // constraint_instance_id -> committed iSAM2 factor indices, so a revised
+    // constraint reusing the same instance id can remove the superseded factors.
+    std::map<std::string, std::vector<size_t>> m_committed_by_instance;
+    // Factor indices to remove on the next iSAM2 update (revision).
     std::vector<size_t> m_pending_removals;
-    // Set when a landmark observation closes a loop (re-sights an existing
-    // landmark) this cycle, so smoothAndUpdate runs the extra relinearization
-    // passes a large correction needs (mirrors the lidar loop path).
-    bool m_landmark_closure = false;
+    // Set when a constraint closes a loop (re-sights an existing location) or a
+    // revision removes factors this cycle, so smoothAndUpdate runs the extra
+    // relinearization passes a large correction needs (mirrors the lidar path).
+    bool m_location_closure = false;
 };

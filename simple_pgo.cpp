@@ -87,14 +87,30 @@ bool SimplePGO::isKeyPose(const PoseWithTime &pose)
         return true;
     return false;
 }
-bool SimplePGO::addKeyPose(const CloudWithPose &cloud_with_pose)
+static geometry_msgs::PoseStamped make_pose_stamped(const M3D &r, const V3D &t,
+                                                    const std::string &frame_id, double ts)
 {
-    bool is_key_pose = isKeyPose(cloud_with_pose.pose);
-    if (!is_key_pose)
-        return false;
+    geometry_msgs::PoseStamped ps;
+    ps.header.frame_id = frame_id;
+    ps.header.stamp.sec = static_cast<int32_t>(ts);
+    ps.header.stamp.nsec = static_cast<uint32_t>((ts - static_cast<int32_t>(ts)) * 1e9);
+    Eigen::Quaterniond q(r);
+    ps.pose.position.x = t.x();
+    ps.pose.position.y = t.y();
+    ps.pose.position.z = t.z();
+    ps.pose.orientation.x = q.x();
+    ps.pose.orientation.y = q.y();
+    ps.pose.orientation.z = q.z();
+    ps.pose.orientation.w = q.w();
+    return ps;
+}
+
+size_t SimplePGO::insertPoseNode(const PoseWithTime &pose, CloudType::Ptr cloud,
+                                 const std::string &frame_id)
+{
     size_t idx = m_key_poses.size();
-    M3D init_r = m_r_offset * cloud_with_pose.pose.r;
-    V3D init_t = m_r_offset * cloud_with_pose.pose.t + m_t_offset;
+    M3D init_r = m_r_offset * pose.r;
+    V3D init_t = m_r_offset * pose.t + m_t_offset;
     // 添加初始值
     m_initial_values.insert(idx, gtsam::Pose3(gtsam::Rot3(init_r), gtsam::Point3(init_t)));
     if (idx == 0)
@@ -119,8 +135,8 @@ bool SimplePGO::addKeyPose(const CloudWithPose &cloud_with_pose)
     {
         // 添加里程计约束
         const KeyPoseWithCloud &last_item = m_key_poses.back();
-        M3D r_between = last_item.r_local.transpose() * cloud_with_pose.pose.r;
-        V3D t_between = last_item.r_local.transpose() * (cloud_with_pose.pose.t - last_item.t_local);
+        M3D r_between = last_item.r_local.transpose() * pose.r;
+        V3D t_between = last_item.r_local.transpose() * (pose.t - last_item.t_local);
         // Anisotropic: stiff relative roll/pitch (gravity-accurate), looser yaw.
         gtsam::noiseModel::Diagonal::shared_ptr noise = gtsam::noiseModel::Diagonal::Variances(
             (gtsam::Vector(6) << m_config.odom_rot_rp_var, m_config.odom_rot_rp_var,
@@ -145,24 +161,23 @@ bool SimplePGO::addKeyPose(const CloudWithPose &cloud_with_pose)
         }
     }
     KeyPoseWithCloud item;
-    item.time = cloud_with_pose.pose.second;
-    item.r_local = cloud_with_pose.pose.r;
-    item.t_local = cloud_with_pose.pose.t;
-    item.body_cloud = cloud_with_pose.cloud;
+    item.time = pose.second;
+    item.r_local = pose.r;
+    item.t_local = pose.t;
+    item.body_cloud = cloud;
     item.r_global = init_r;
     item.t_global = init_t;
-    item.landmark_obs = cloud_with_pose.landmark_obs;
     m_key_poses.push_back(item);
 
-    // Attach decoupled Landmark-event factors (variable + observation factor)
-    // for this keyframe, so the next smoothAndUpdate optimizes them jointly.
-    if (m_config.use_landmarks)
-        addLandmarkFactors(idx);
+    // Record this node's frame (from the odometry) alongside its pose. GTSAM's
+    // own Pose3 value carries no frame; this is the parallel bookkeeping.
+    m_node_poses[idx] = make_pose_stamped(pose.r, pose.t, frame_id, pose.second);
 
-    // Cache the Scan Context descriptor + ring-key for this keyframe.
-    if (cloud_with_pose.cloud) {
+    // Cache the Scan Context descriptor + ring-key for this node (empty when the
+    // node has no cloud, e.g. a constraint-triggered node).
+    if (cloud) {
         scan_context::Descriptor descriptor =
-            scan_context::make_descriptor(*cloud_with_pose.cloud, m_scan_context_config);
+            scan_context::make_descriptor(*cloud, m_scan_context_config);
         m_scan_context_ring_keys.push_back(scan_context::make_ring_key(descriptor));
         m_scan_context_descriptors.push_back(std::move(descriptor));
     } else {
@@ -170,6 +185,34 @@ bool SimplePGO::addKeyPose(const CloudWithPose &cloud_with_pose)
         m_scan_context_ring_keys.emplace_back();
     }
 
+    return idx;
+}
+
+bool SimplePGO::addKeyPose(const CloudWithPose &cloud_with_pose)
+{
+    if (!isKeyPose(cloud_with_pose.pose))
+        return false;
+    insertPoseNode(cloud_with_pose.pose, cloud_with_pose.cloud, cloud_with_pose.frame_id);
+    return true;
+}
+
+bool SimplePGO::addLocationConstraint(const PoseWithTime &pose, const std::string &frame_id,
+                                      const LocationConstraintObs &constraint)
+{
+    // Each LocationConstraint becomes its OWN pose node (placed at the
+    // interpolated-odometry pose for its timestamp), linked to the backbone by an
+    // odom between-factor — so the constraint's transform is used as-is, with no
+    // re-basing, and the odometry uncertainty is modeled by that backbone factor.
+    // A new node needs a previous node to bridge from; a constraint arriving
+    // before any keyframe exists would become the graph origin with no odometry
+    // context, so drop it instead.
+    // NOTE: every constraint adds a node, so rapid revision bursts can grow the
+    // graph quickly. Likely a micro-optimization; revisit (dedup by instance id /
+    // reuse the node) only if node count becomes a problem.
+    if (m_key_poses.empty())
+        return false;
+    size_t node_idx = insertPoseNode(pose, nullptr, frame_id);
+    addLocationConstraintFactors(node_idx, constraint);
     return true;
 }
 
@@ -455,91 +498,73 @@ void SimplePGO::searchForLoopPairs()
     m_history_pairs.emplace_back(one_pair.target_id, one_pair.source_id);
 }
 
-void SimplePGO::addLandmarkFactors(size_t keyframe_idx)
+void SimplePGO::addLocationConstraintFactors(size_t node_idx, const LocationConstraintObs &constraint)
 {
-    KeyPoseWithCloud &kf = m_key_poses[keyframe_idx];
-    if (kf.landmark_obs.empty())
-        return;
+    const KeyPoseWithCloud &node = m_key_poses[node_idx];
 
-    for (const LandmarkObs &obs : kf.landmark_obs)
+    // Ensure a graph variable for this location id (Symbol('l', index)).
+    auto found = m_location_index.find(constraint.to_id);
+    int loc_idx;
+    bool is_new = (found == m_location_index.end());
+    if (is_new)
     {
-        // Ensure a graph variable for this landmark id (Symbol('l', index)).
-        auto found = m_landmark_index.find(obs.id);
-        int lm_idx;
-        bool is_new = (found == m_landmark_index.end());
-        if (is_new)
-        {
-            lm_idx = m_next_landmark++;
-            m_landmark_index[obs.id] = lm_idx;
-        }
-        else
-        {
-            lm_idx = found->second;
-            m_landmark_closure = true;  // re-sighting => a loop closure
-        }
-        gtsam::Key lm_key = gtsam::Symbol('l', lm_idx);
-
-        if (is_new)
-        {
-            // Initialize the landmark in the world frame from this keyframe.
-            M3D r_lm_world = kf.r_global * obs.r_body_lm;
-            V3D t_lm_world = kf.r_global * obs.t_body_lm + kf.t_global;
-            m_initial_values.insert(
-                lm_key, gtsam::Pose3(gtsam::Rot3(r_lm_world), gtsam::Point3(t_lm_world)));
-        }
-
-        // Corrective replacement: schedule removal of committed same-id factors
-        // observed within `replacement_ms` before this one (the stale estimate
-        // of the same sighting), but never the new factor itself.
-        if (obs.replacement_ms > 0.0)
-        {
-            const double cutoff = obs.ts - obs.replacement_ms / 1000.0;
-            auto &committed = m_committed_landmarks[obs.id];
-            std::vector<std::pair<double, size_t>> keep;
-            keep.reserve(committed.size());
-            for (const auto &entry : committed)
-            {
-                if (entry.first > cutoff && entry.first < obs.ts)
-                    m_pending_removals.push_back(entry.second);
-                else
-                    keep.push_back(entry);
-            }
-            committed.swap(keep);
-        }
-
-        // Anisotropic observation noise, built in the landmark frame (normal =
-        // +z) then rotated into the body frame.
-        V3D trans_var(m_config.landmark_var_inplane_trans_m2,
-                      m_config.landmark_var_inplane_trans_m2,
-                      m_config.landmark_var_range_trans_m2);
-        V3D rot_var(m_config.landmark_var_outplane_rot_rad2,
-                    m_config.landmark_var_outplane_rot_rad2,
-                    m_config.landmark_var_yaw_rot_rad2);
-        M3D trans_cov = obs.r_body_lm * trans_var.asDiagonal() * obs.r_body_lm.transpose();
-        M3D rot_cov = obs.r_body_lm * rot_var.asDiagonal() * obs.r_body_lm.transpose();
-        gtsam::Matrix6 cov = gtsam::Matrix6::Zero();
-        cov.block<3, 3>(0, 0) = rot_cov;    // Pose3 order: rotation first
-        cov.block<3, 3>(3, 3) = trans_cov;  // then translation
-        gtsam::SharedNoiseModel noise = gtsam::noiseModel::Gaussian::Covariance(cov);
-        if (m_config.loop_robust_kernel)
-            noise = gtsam::noiseModel::Robust::Create(
-                gtsam::noiseModel::mEstimator::Huber::Create(m_config.loop_robust_huber_k),
-                noise);
-
-        // Observation factor: keyframe -> landmark relative pose = T_body_lm.
-        size_t graph_pos = m_graph.size();
-        m_graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
-            keyframe_idx, lm_key,
-            gtsam::Pose3(gtsam::Rot3(obs.r_body_lm), gtsam::Point3(obs.t_body_lm)),
-            noise));
-        m_staged_landmark_factors.push_back({obs.id, obs.ts, graph_pos});
-
-        if (m_config.debug)
-            fprintf(stderr,
-                    "PGO_LANDMARK kf=%zu id=%s new=%d |t_body_lm|=%.2f replacement_ms=%.0f\n",
-                    keyframe_idx, obs.id.c_str(), is_new ? 1 : 0,
-                    obs.t_body_lm.norm(), obs.replacement_ms);
+        loc_idx = m_next_location++;
+        m_location_index[constraint.to_id] = loc_idx;
     }
+    else
+    {
+        loc_idx = found->second;
+        m_location_closure = true;  // re-sighting => a loop closure
+    }
+    gtsam::Key loc_key = gtsam::Symbol('l', loc_idx);
+
+    if (is_new)
+    {
+        // Initialize the location in the world frame from this node.
+        M3D r_loc_world = node.r_global * constraint.r_body_loc;
+        V3D t_loc_world = node.r_global * constraint.t_body_loc + node.t_global;
+        m_initial_values.insert(
+            loc_key, gtsam::Pose3(gtsam::Rot3(r_loc_world), gtsam::Point3(t_loc_world)));
+    }
+
+    // Revision: a constraint reusing an existing constraint_instance_id supersedes
+    // the committed factors carrying that id -> schedule them for removal. Lets an
+    // external estimator roll out a better estimate (improving tag/GPS lock) and
+    // drop its earlier ones.
+    if (!constraint.constraint_instance_id.empty())
+    {
+        auto committed = m_committed_by_instance.find(constraint.constraint_instance_id);
+        if (committed != m_committed_by_instance.end() && !committed->second.empty())
+        {
+            for (size_t factor_index : committed->second)
+                m_pending_removals.push_back(factor_index);
+            committed->second.clear();
+            m_location_closure = true;  // removal also earns the extra relin passes
+        }
+    }
+
+    // Noise model = the covariance carried in the message (already in GTSAM Pose3
+    // tangent order [rot(3), trans(3)]) -> straight into the factor. Robust kernel
+    // optional.
+    gtsam::SharedNoiseModel noise = gtsam::noiseModel::Gaussian::Covariance(constraint.covariance);
+    if (m_config.loop_robust_kernel)
+        noise = gtsam::noiseModel::Robust::Create(
+            gtsam::noiseModel::mEstimator::Huber::Create(m_config.loop_robust_huber_k),
+            noise);
+
+    // Observation factor: node -> location relative pose = T_body_loc.
+    size_t graph_pos = m_graph.size();
+    m_graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
+        node_idx, loc_key,
+        gtsam::Pose3(gtsam::Rot3(constraint.r_body_loc), gtsam::Point3(constraint.t_body_loc)),
+        noise));
+    m_staged_constraint_factors.push_back({constraint.constraint_instance_id, graph_pos});
+
+    if (m_config.debug)
+        fprintf(stderr,
+                "PGO_LOCATION node=%zu to_id=%s new=%d |t_body_loc|=%.2f instance=%s\n",
+                node_idx, constraint.to_id.c_str(), is_new ? 1 : 0,
+                constraint.t_body_loc.norm(), constraint.constraint_instance_id.c_str());
 }
 
 void SimplePGO::smoothAndUpdate()
@@ -564,12 +589,12 @@ void SimplePGO::smoothAndUpdate()
         }
         std::vector<LoopPair>().swap(m_cache_pairs);
     }
-    // A re-sighted landmark closes a loop just like a lidar closure, so it
+    // A re-sighted location closes a loop just like a lidar closure, so it
     // earns the same extra relinearization passes (a large correction needs them).
-    bool has_closure = has_loop || m_landmark_closure;
+    bool has_closure = has_loop || m_location_closure;
 
-    // smooth and mapping. removeFactorIndices applies `replacement`: stale same-id
-    // landmark observation factors superseded by a corrective Landmark are dropped.
+    // smooth and mapping. removeFactorIndices applies constraint revision: factors
+    // superseded by a constraint reusing the same constraint_instance_id are dropped.
     gtsam::FactorIndices remove(m_pending_removals.begin(), m_pending_removals.end());
     gtsam::ISAM2Result result = m_isam2->update(m_graph, m_initial_values, remove);
     m_isam2->update();
@@ -581,17 +606,18 @@ void SimplePGO::smoothAndUpdate()
         m_isam2->update();
     }
 
-    // Record the iSAM2 factor index assigned to each staged landmark observation
-    // factor so a future corrective Landmark can remove it (replacement).
-    for (const StagedLandmarkFactor &staged : m_staged_landmark_factors)
+    // Record the iSAM2 factor index assigned to each staged constraint factor so a
+    // future revision (same constraint_instance_id) can remove it. Constraints with
+    // an empty instance id are not tracked (no revision capability).
+    for (const StagedConstraintFactor &staged : m_staged_constraint_factors)
     {
-        if (staged.graph_pos < result.newFactorsIndices.size())
-            m_committed_landmarks[staged.id].emplace_back(
-                staged.ts, result.newFactorsIndices[staged.graph_pos]);
+        if (!staged.instance_id.empty() && staged.graph_pos < result.newFactorsIndices.size())
+            m_committed_by_instance[staged.instance_id].push_back(
+                result.newFactorsIndices[staged.graph_pos]);
     }
-    m_staged_landmark_factors.clear();
+    m_staged_constraint_factors.clear();
     m_pending_removals.clear();
-    m_landmark_closure = false;
+    m_location_closure = false;
 
     m_graph.resize(0);
     m_initial_values.clear();
