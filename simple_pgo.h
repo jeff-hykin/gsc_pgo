@@ -26,9 +26,6 @@ struct KeyPoseWithCloud
     V3D t_global;
     double time;
     CloudType::Ptr body_cloud;
-    // Fiducial tags seen at this keyframe, in the body frame:
-    // tag_id -> (R_body_tag, t_body_tag). Empty unless tag loop closure is on.
-    std::map<int, std::pair<M3D, V3D>> tag_obs;
     // Landmark events associated with this keyframe (use_landmarks path).
     std::vector<LandmarkObs> landmark_obs;
 };
@@ -38,9 +35,8 @@ struct LoopPair
     size_t target_id;
     M3D r_offset;
     V3D t_offset;
-    double score;                       // diagnostic: ICP fitness (lidar) or 0 (tag)
+    double score;                       // diagnostic: ICP fitness (lidar) or 0 otherwise
     gtsam::SharedNoiseModel noise;      // per-constraint noise model (set at detection)
-    bool from_tag = false;              // true for tag closures (for logging / graph viz)
 };
 
 struct Config
@@ -85,30 +81,7 @@ struct Config
     // descriptor structure — the data to design the right loop-acceptance gate.
     bool debug = false;
 
-    // --- Tag (AprilTag/ArUco) loop closure ----------------------------------
-    // All off by default: when use_tag_loop_closure is false nothing below runs
-    // and the module behaves exactly as before.
-    bool use_tag_loop_closure = false;
-    // Two sightings of the same tag must be at least this far apart in time to
-    // form a closure (mirrors loop_time_thresh; avoids near-duplicate frames).
-    double tag_loop_time_thresh = 5.0;
-    // Anisotropic measurement noise for a tag-derived relative pose, expressed
-    // in the *tag* frame (tag normal = local +z) then rotated into the graph
-    // frame. Variances, not stddevs. In-plane (x,y) translation and yaw (about
-    // the normal) are well observed; range (along the normal) and out-of-plane
-    // tilt carry the planar-PnP / flip ambiguity, so they are deliberately loose
-    // — this is what stops tag range error from leaking into z.
-    double tag_var_inplane_trans_m2 = 0.0025;   // (5 cm)^2  on tag x,y
-    double tag_var_range_trans_m2 = 0.25;       // (50 cm)^2 along tag normal (range)
-    double tag_var_yaw_rot_rad2 = 0.0025;       // (~2.9 deg)^2 about tag normal
-    double tag_var_outplane_rot_rad2 = 0.04;    // (~11 deg)^2 out-of-plane tilt
-    // Mahalanobis^2 gate: reject a tag closure whose measured relative pose
-    // disagrees with the current estimate by more than this (6-DOF chi^2 95% =
-    // 12.59). 0 disables — the robust kernel is the primary outlier defense and
-    // the gate can wrongly reject the very closures needed to fix large drift.
-    double tag_consistency_chi2 = 0.0;
-
-    // Robust (M-estimator) kernel wrapping *all* loop factors (lidar + tag).
+    // Robust (M-estimator) kernel wrapping *all* loop factors (lidar + landmark).
     // Off by default to preserve the original Gaussian behavior bit-for-bit.
     bool loop_robust_kernel = false;
     double loop_robust_huber_k = 1.345;
@@ -122,8 +95,8 @@ struct Config
     bool use_landmarks = false;
     // Measurement noise for a landmark observation (body<-landmark relative
     // pose), built anisotropically in the landmark frame then rotated into the
-    // body frame, mirroring the tag closure model (in-plane + yaw well observed,
-    // range + out-of-plane tilt loose). Variances.
+    // body frame (in-plane + yaw well observed, range + out-of-plane tilt
+    // loose). Variances.
     double landmark_var_inplane_trans_m2 = 0.0025;  // (5 cm)^2
     double landmark_var_range_trans_m2 = 0.25;      // (50 cm)^2 along normal
     double landmark_var_yaw_rot_rad2 = 0.0025;      // (~2.9 deg)^2
@@ -215,10 +188,6 @@ private:
     // Original position-based fallback (radius search on past key-pose
     // positions). Kept for ablation + when scan context is disabled.
     int searchByPosition() const;
-    // Tag-based closures for the newest keyframe: for each tag it sees, find an
-    // earlier keyframe that saw the same tag (>tag_loop_time_thresh apart) and
-    // push a LoopPair carrying an anisotropic, tag-aligned noise model.
-    void searchByTags();
 
     // Landmark-event factors for the newest keyframe: for each LandmarkObs it
     // carries, ensure a graph variable for that landmark id exists (initialized
@@ -257,6 +226,6 @@ private:
     std::vector<size_t> m_pending_removals;
     // Set when a landmark observation closes a loop (re-sights an existing
     // landmark) this cycle, so smoothAndUpdate runs the extra relinearization
-    // passes a large correction needs (mirrors the lidar/tag loop path).
+    // passes a large correction needs (mirrors the lidar loop path).
     bool m_landmark_closure = false;
 };

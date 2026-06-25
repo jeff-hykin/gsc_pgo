@@ -28,7 +28,6 @@
 #include "nav_msgs/Odometry.hpp"
 #include "nav_msgs/Path.hpp"
 #include "sensor_msgs/PointCloud2.hpp"
-#include "vision_msgs/Detection3DArray.hpp"
 #include "geometry_msgs/Pose.hpp"
 #include "geometry_msgs/PoseStamped.hpp"
 #include "geometry_msgs/Quaternion.hpp"
@@ -57,8 +56,8 @@ static V3D g_latest_t = V3D::Zero();
 static double g_latest_time = 0.0;
 static bool g_has_odom = false;
 
-// --- Tag (AprilTag/ArUco) loop closure state ----------------------------------
-// A tag detection's pose is in its own header.frame_id (the camera frame). We
+// --- Static-frame resolution --------------------------------------------------
+// A Landmark event's pose is in its own frame_id (typically a camera frame). We
 // resolve that frame to the robot body via the *static* TF tree (/tf_static) —
 // the fixed camera mount. Frames that only exist on the dynamic /tf tree (map,
 // odom) won't resolve, which is exactly right: their pose already has odometry
@@ -67,22 +66,12 @@ struct Tf { M3D r = M3D::Identity(); V3D t = V3D::Zero(); };  // p_out = r*p_in 
 static Tf tf_compose(const Tf& a, const Tf& b) { return {a.r * b.r, a.r * b.t + a.t}; }
 static Tf tf_inverse(const Tf& a) { M3D ri = a.r.transpose(); return {ri, -ri * a.t}; }
 
-struct TagFrame {
-    double ts = 0.0;
-    std::map<int, std::pair<M3D, V3D>> obs;  // tag_id -> (R_body_tag, t_body_tag)
-};
-static std::mutex g_tag_mutex;
-static std::deque<TagFrame> g_tag_buffer;
-static bool g_use_tags = false;
-static double g_tag_assoc_max_dt = 0.1;   // s: max |tag_ts - keyframe_ts| to associate
-static double g_tag_buffer_window = 2.0;  // s: how long to retain tag frames
-
 // --- Landmark-event state ------------------------------------------------------
 // Decoupled Landmark events (a separate perceiver emits them). A Landmark's pose
 // is the landmark in its header frame_id (a camera frame); we resolve that frame
 // to the body via /tf_static, compose landmark-in-body, and buffer it for
-// time-association to a keyframe — the same pattern as the tag path, but the
-// detection + noise/confidence filtering happen upstream in the perceiver.
+// time-association to a keyframe. The detection + noise/confidence filtering
+// happen upstream in the perceiver.
 static std::mutex g_landmark_mutex;
 static std::deque<LandmarkObs> g_landmark_buffer;
 static bool g_use_landmarks = false;
@@ -193,55 +182,6 @@ public:
         }
     }
 
-    // Each Detection3D carries a tag pose in its header.frame_id (the camera
-    // frame) and the marker id (`id` string). We resolve that frame to the body
-    // via /tf_static, compose tag-in-body, and buffer it for time-association.
-    void on_tag_detections(const lcm::ReceiveBuffer*, const std::string&,
-                           const vision_msgs::Detection3DArray* msg) {
-        if (!g_use_tags)
-            return;
-        TagFrame frame;
-        frame.ts = msg->header.stamp.sec + msg->header.stamp.nsec / 1e9;
-        for (const auto& detection : msg->detections) {
-            if (detection.results_length < 1)
-                continue;
-            int tag_id = 0;
-            try {
-                tag_id = std::stoi(detection.id);
-            } catch (...) {
-                continue;  // non-numeric id: skip
-            }
-            // Frame the pose is expressed in (per-detection, else array header).
-            std::string frame_id = !detection.header.frame_id.empty()
-                ? detection.header.frame_id : msg->header.frame_id;
-            Tf t_body_frame;
-            if (!resolve_static_tf(g_body_frame, frame_id, t_body_frame)) {
-                if (g_tf_warned.insert(frame_id).second)
-                    fprintf(stderr,
-                            "PGO: tag frame '%s' has no static path to '%s' "
-                            "(dynamic/map frame?); skipping its detections\n",
-                            frame_id.c_str(), g_body_frame.c_str());
-                continue;
-            }
-            const auto& pose = detection.results[0].pose.pose;
-            Tf t_frame_tag;
-            t_frame_tag.r = Eigen::Quaterniond(
-                pose.orientation.w, pose.orientation.x,
-                pose.orientation.y, pose.orientation.z).toRotationMatrix();
-            t_frame_tag.t = V3D(pose.position.x, pose.position.y, pose.position.z);
-            Tf t_body_tag = tf_compose(t_body_frame, t_frame_tag);
-            frame.obs[tag_id] = {t_body_tag.r, t_body_tag.t};
-        }
-        if (frame.obs.empty())
-            return;
-        std::lock_guard<std::mutex> lock(g_tag_mutex);
-        g_tag_buffer.push_back(std::move(frame));
-        while (!g_tag_buffer.empty() &&
-               frame.ts - g_tag_buffer.front().ts > g_tag_buffer_window) {
-            g_tag_buffer.pop_front();
-        }
-    }
-
     // A decoupled Landmark event. Its pose is the landmark in header.frame_id (a
     // camera frame); resolve that to the body via /tf_static, compose
     // landmark-in-body, and buffer it for time-association to a keyframe.
@@ -286,26 +226,10 @@ private:
     std::set<std::string> g_tf_warned;  // frames already warned about (once each)
 };
 
-// Tag observations whose timestamp is closest to the keyframe time, within
-// g_tag_assoc_max_dt. Empty if no frame is close enough.
-static std::map<int, std::pair<M3D, V3D>> tags_near(double keyframe_ts) {
-    std::lock_guard<std::mutex> lock(g_tag_mutex);
-    const TagFrame* best = nullptr;
-    double best_dt = g_tag_assoc_max_dt;
-    for (const auto& frame : g_tag_buffer) {
-        double dt = std::abs(frame.ts - keyframe_ts);
-        if (dt <= best_dt) {
-            best_dt = dt;
-            best = &frame;
-        }
-    }
-    return best ? best->obs : std::map<int, std::pair<M3D, V3D>>{};
-}
-
 // Landmark observations to associate with a keyframe: for each landmark id, the
 // buffered sighting closest to the keyframe time within g_landmark_assoc_max_dt.
-// Like tags_near, this does not consume the buffer (the buffer window expires
-// stale entries); addKeyPose only stores these if the scan becomes a keyframe.
+// This does not consume the buffer (the buffer window expires stale entries);
+// addKeyPose only stores these if the scan becomes a keyframe.
 static std::vector<LandmarkObs> landmarks_near(double keyframe_ts) {
     std::lock_guard<std::mutex> lock(g_landmark_mutex);
     std::map<std::string, size_t> best_idx;
@@ -497,20 +421,9 @@ int main(int argc, char** argv)
     config.loop_min_occupancy = native_module.arg_int("loop_min_occupancy", 80);
     config.loop_min_degeneracy = native_module.arg_float("loop_min_degeneracy", 0.05f);
 
-    // Tag loop closure
-    config.use_tag_loop_closure = native_module.arg_bool("use_tag_loop_closure", false);
-    config.tag_loop_time_thresh = native_module.arg_float("tag_loop_time_thresh", 5.0f);
-    config.tag_var_inplane_trans_m2 = native_module.arg_float("tag_var_inplane_trans_m2", 0.0025f);
-    config.tag_var_range_trans_m2 = native_module.arg_float("tag_var_range_trans_m2", 0.25f);
-    config.tag_var_yaw_rot_rad2 = native_module.arg_float("tag_var_yaw_rot_rad2", 0.0025f);
-    config.tag_var_outplane_rot_rad2 = native_module.arg_float("tag_var_outplane_rot_rad2", 0.04f);
-    config.tag_consistency_chi2 = native_module.arg_float("tag_consistency_chi2", 0.0f);
+    // Robust (M-estimator) kernel wrapping all loop factors (lidar + landmark).
     config.loop_robust_kernel = native_module.arg_bool("loop_robust_kernel", false);
     config.loop_robust_huber_k = native_module.arg_float("loop_robust_huber_k", 1.345f);
-
-    g_use_tags = config.use_tag_loop_closure;
-    g_tag_assoc_max_dt = native_module.arg_float("tag_assoc_max_dt", 0.1f);
-    g_tag_buffer_window = native_module.arg_float("tag_buffer_window", 2.0f);
 
     // Landmark events (decoupled perceiver -> PGO factor-graph manager).
     config.use_landmarks = native_module.arg_bool("use_landmarks", false);
@@ -541,7 +454,7 @@ int main(int argc, char** argv)
     std::string frame_id = native_module.arg("frame_id", "map");
     std::string child_frame_id = native_module.arg("child_frame_id", "odom");
     std::string body_frame = native_module.arg("body_frame", "base_link");
-    g_body_frame = body_frame;  // target frame for tag-frame TF resolution
+    g_body_frame = body_frame;  // target frame for landmark-frame TF resolution
     float global_map_voxel_size = native_module.arg_float("global_map_voxel_size", 0.1f);
     float global_map_publish_rate = native_module.arg_float("global_map_publish_rate", 0.0f);
     // OFF by default (rate <= 0 disables it). Published on the internal `_global_map`
@@ -575,17 +488,13 @@ int main(int argc, char** argv)
     Handlers handlers;
     lcm.subscribe(odom_topic, &Handlers::on_odometry, &handlers);
     lcm.subscribe(scan_topic, &Handlers::on_registered_scan, &handlers);
-    if (g_use_tags && native_module.has("tag_detections")) {
-        lcm.subscribe(native_module.topic("tag_detections"),
-                      &Handlers::on_tag_detections, &handlers);
-    }
     if (g_use_landmarks && native_module.has("landmarks")) {
         lcm.subscribe(native_module.topic("landmarks"),
                       &Handlers::on_landmark, &handlers);
     }
-    // The fixed camera mount (tag/landmark frame -> body) lives on the static
-    // tree; subscribe once if either tag or landmark ingestion needs it.
-    if (g_use_tags || g_use_landmarks) {
+    // The fixed camera mount (landmark frame -> body) lives on the static tree;
+    // subscribe once if landmark ingestion needs it.
+    if (g_use_landmarks) {
         std::string tf_static_channel =
             native_module.arg("tf_static_channel", "/tf_static#tf2_msgs.TFMessage");
         lcm.subscribe(tf_static_channel, &Handlers::on_static_tf, &handlers);
@@ -653,11 +562,9 @@ int main(int argc, char** argv)
 
         double cur_time = cloud_with_pose.pose.second;
 
-        // Attach the tag detections nearest this scan's time (no-op if tags off
-        // or none in the association window). addKeyPose stores them only if
-        // this scan becomes a keyframe.
-        if (g_use_tags)
-            cloud_with_pose.tag_obs = tags_near(cur_time);
+        // Attach the landmark events nearest this scan's time (no-op if off or
+        // none in the association window). addKeyPose stores them only if this
+        // scan becomes a keyframe.
         if (g_use_landmarks)
             cloud_with_pose.landmark_obs = landmarks_near(cur_time);
 

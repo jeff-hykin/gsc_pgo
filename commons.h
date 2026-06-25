@@ -26,8 +26,8 @@ struct PoseWithTime {
     void setTime(int32_t sec, uint32_t nsec);
 };
 
-// A landmark sighting routed in as a decoupled Landmark *event* (vs the raw
-// tag_obs path). Pose is the landmark in the body frame at the observing
+// A landmark sighting routed in as a decoupled Landmark *event*. Pose is the
+// landmark in the body frame at the observing
 // keyframe (camera->body extrinsic resolved upstream). `id` is the URL-like
 // Landmark.id; two sightings sharing an id observe the same graph variable,
 // which closes the loop. `replacement_ms` > 0 => corrective: any committed
@@ -44,9 +44,6 @@ struct LandmarkObs {
 struct CloudWithPose {
     CloudType::Ptr cloud;
     PoseWithTime pose;
-    // Fiducial tags seen by this scan, expressed in the body frame:
-    // tag_id -> (R_body_tag, t_body_tag). Empty unless tag loop closure is on.
-    std::map<int, std::pair<M3D, V3D>> tag_obs;
     // Landmark events associated with this scan (use_landmarks path).
     std::vector<LandmarkObs> landmark_obs;
 };

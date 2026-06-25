@@ -151,7 +151,6 @@ bool SimplePGO::addKeyPose(const CloudWithPose &cloud_with_pose)
     item.body_cloud = cloud_with_pose.cloud;
     item.r_global = init_r;
     item.t_global = init_t;
-    item.tag_obs = cloud_with_pose.tag_obs;
     item.landmark_obs = cloud_with_pose.landmark_obs;
     m_key_poses.push_back(item);
 
@@ -307,12 +306,6 @@ int SimplePGO::searchByScanContext(int& out_sector_shift, float& out_best, float
 
 void SimplePGO::searchForLoopPairs()
 {
-    // Tag closures are independent of the lidar/scan-context path below and its
-    // feature-poverty gates, so run them first (before any early return).
-    if (m_config.use_tag_loop_closure) {
-        searchByTags();
-    }
-
     if (m_key_poses.size() < 10)
         return;
     if (m_config.min_loop_detect_duration > 0.0)
@@ -462,92 +455,6 @@ void SimplePGO::searchForLoopPairs()
     m_history_pairs.emplace_back(one_pair.target_id, one_pair.source_id);
 }
 
-void SimplePGO::searchByTags()
-{
-    const size_t cur_idx = m_key_poses.size() - 1;
-    const KeyPoseWithCloud &cur = m_key_poses[cur_idx];
-    if (cur.tag_obs.empty())
-        return;
-
-    for (const auto &[tag_id, cur_obs] : cur.tag_obs)
-    {
-        const M3D &r_cur_tag = cur_obs.first;
-        const V3D &t_cur_tag = cur_obs.second;
-
-        // Earliest earlier keyframe that saw this tag far enough back in time.
-        // Earliest maximizes drift-correction leverage; the robust kernel
-        // guards against a bad single sighting.
-        int target = -1;
-        for (size_t i = 0; i < cur_idx; i++)
-        {
-            if (m_key_poses[i].tag_obs.count(tag_id) == 0)
-                continue;
-            if (std::abs(cur.time - m_key_poses[i].time) < m_config.tag_loop_time_thresh)
-                continue;
-            target = static_cast<int>(i);
-            break;
-        }
-        if (target < 0)
-            continue;
-
-        const M3D &r_tgt_tag = m_key_poses[target].tag_obs.at(tag_id).first;
-        const V3D &t_tgt_tag = m_key_poses[target].tag_obs.at(tag_id).second;
-
-        // Relative body pose target<-cur from the shared, fixed tag. The tag and
-        // odometry cancel: T_tgt_cur = T_tgt_tag * T_cur_tag^-1.
-        M3D r_offset = r_tgt_tag * r_cur_tag.transpose();
-        V3D t_offset = t_tgt_tag - r_offset * t_cur_tag;
-
-        // Anisotropic covariance built in the tag frame (normal = +z), then
-        // rotated into the target keyframe's body frame (the frame the
-        // BetweenFactor tangent lives in). Rotation/translation blocks rotated
-        // independently — the standard pragmatic approximation (no Adjoint
-        // rotation/translation coupling), which the robust kernel absorbs.
-        V3D trans_var(m_config.tag_var_inplane_trans_m2,
-                      m_config.tag_var_inplane_trans_m2,
-                      m_config.tag_var_range_trans_m2);
-        V3D rot_var(m_config.tag_var_outplane_rot_rad2,
-                    m_config.tag_var_outplane_rot_rad2,
-                    m_config.tag_var_yaw_rot_rad2);
-        M3D trans_cov = r_tgt_tag * trans_var.asDiagonal() * r_tgt_tag.transpose();
-        M3D rot_cov = r_tgt_tag * rot_var.asDiagonal() * r_tgt_tag.transpose();
-        gtsam::Matrix6 cov = gtsam::Matrix6::Zero();
-        cov.block<3, 3>(0, 0) = rot_cov;     // gtsam Pose3 order: rotation first
-        cov.block<3, 3>(3, 3) = trans_cov;   // then translation
-
-        // Consistency gate (off by default): Mahalanobis^2 of the measured
-        // relative pose vs the current estimate.
-        if (m_config.tag_consistency_chi2 > 0.0)
-        {
-            M3D r_pred = m_key_poses[target].r_global.transpose() * m_key_poses[cur_idx].r_global;
-            V3D t_pred = m_key_poses[target].r_global.transpose() *
-                         (m_key_poses[cur_idx].t_global - m_key_poses[target].t_global);
-            gtsam::Pose3 meas(gtsam::Rot3(r_offset), gtsam::Point3(t_offset.x(), t_offset.y(), t_offset.z()));
-            gtsam::Pose3 pred(gtsam::Rot3(r_pred), gtsam::Point3(t_pred.x(), t_pred.y(), t_pred.z()));
-            gtsam::Vector6 err = gtsam::Pose3::Logmap(meas.between(pred));
-            double mahalanobis_sq = err.transpose() * cov.inverse() * err;
-            if (mahalanobis_sq > m_config.tag_consistency_chi2)
-                continue;
-        }
-
-        LoopPair pair;
-        pair.source_id = cur_idx;
-        pair.target_id = static_cast<size_t>(target);
-        pair.r_offset = r_offset;
-        pair.t_offset = t_offset;
-        pair.score = 0.0;
-        pair.from_tag = true;
-        pair.noise = gtsam::noiseModel::Gaussian::Covariance(cov);
-        m_cache_pairs.push_back(pair);
-        m_history_pairs.emplace_back(pair.target_id, pair.source_id);
-
-        if (m_config.debug)
-            fprintf(stderr,
-                    "PGO_TAG kf=%zu tgt=%d tag=%d |t_offset|=%.2f\n",
-                    cur_idx, target, tag_id, t_offset.norm());
-    }
-}
-
 void SimplePGO::addLandmarkFactors(size_t keyframe_idx)
 {
     KeyPoseWithCloud &kf = m_key_poses[keyframe_idx];
@@ -601,7 +508,7 @@ void SimplePGO::addLandmarkFactors(size_t keyframe_idx)
         }
 
         // Anisotropic observation noise, built in the landmark frame (normal =
-        // +z) then rotated into the body frame — mirrors the tag closure model.
+        // +z) then rotated into the body frame.
         V3D trans_var(m_config.landmark_var_inplane_trans_m2,
                       m_config.landmark_var_inplane_trans_m2,
                       m_config.landmark_var_range_trans_m2);
@@ -657,7 +564,7 @@ void SimplePGO::smoothAndUpdate()
         }
         std::vector<LoopPair>().swap(m_cache_pairs);
     }
-    // A re-sighted landmark closes a loop just like a lidar/tag closure, so it
+    // A re-sighted landmark closes a loop just like a lidar closure, so it
     // earns the same extra relinearization passes (a large correction needs them).
     bool has_closure = has_loop || m_landmark_closure;
 
