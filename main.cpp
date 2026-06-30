@@ -8,6 +8,7 @@
 #include <deque>
 #include <mutex>
 #include <queue>
+#include <random>
 #include <set>
 #include <signal.h>
 #include <thread>
@@ -22,6 +23,7 @@
 #include "dimos_native_module.hpp"
 #include "msgs/Graph3D.hpp"
 #include "msgs/GraphDelta3D.hpp"
+#include "msgs/DeformationNode.hpp"
 #include "msgs/LocationConstraint.hpp"
 #include "point_cloud_utils.hpp"
 
@@ -351,6 +353,43 @@ static dimos::GraphDelta3D build_loop_closure_event(
     return msg;
 }
 
+// Publish the pose graph as individual DeformationNodes (un-batched). Each keyframe
+// keeps a stable random id (assigned on first sight, reused forever) so a consumer can
+// track a node across re-publishes. A node is (re)published only when it's new or the
+// optimizer moved it past an epsilon — so a loop closure that shifts many keyframes
+// emits one node per shifted keyframe, and quiet cycles emit nothing.
+static void publish_deformation_nodes(
+    lcm::LCM& lcm,
+    const std::string& topic,
+    const std::vector<KeyPoseWithCloud>& key_poses,
+    uint64_t tf_id,
+    const std::string& frame_id,
+    std::vector<uint64_t>& ids,
+    std::vector<std::pair<M3D, V3D>>& last_published,
+    std::mt19937_64& rng) {
+    constexpr double kPosEps = 1e-4;       // 0.1 mm
+    constexpr double kRotEps = 1e-5;       // Frobenius-norm threshold on the rotation matrix
+    for (size_t i = 0; i < key_poses.size(); i++) {
+        const auto& kp = key_poses[i];
+        bool is_new = i >= ids.size();
+        if (!is_new) {
+            double pos_moved = (kp.t_global - last_published[i].second).norm();
+            double rot_moved = (kp.r_global - last_published[i].first).norm();
+            if (pos_moved <= kPosEps && rot_moved <= kRotEps) continue;
+            last_published[i] = {kp.r_global, kp.t_global};
+        } else {
+            ids.push_back(rng());
+            last_published.emplace_back(kp.r_global, kp.t_global);
+        }
+        Eigen::Quaterniond q(kp.r_global);
+        dimos::DeformationNode node(
+            ids[i], tf_id, kp.time, frame_id,
+            kp.t_global.x(), kp.t_global.y(), kp.t_global.z(),
+            q.x(), q.y(), q.z(), q.w());
+        node.publish(lcm, topic);
+    }
+}
+
 int main(int argc, char** argv)
 {
     signal(SIGTERM, signal_handler);
@@ -373,6 +412,7 @@ int main(int argc, char** argv)
         native_module.has("_global_map") ? native_module.topic("_global_map") : "";
     std::string pose_graph_topic = native_module.topic("pose_graph");
     std::string loop_closure_event_topic = native_module.topic("loop_closure_event");
+    std::string deformation_nodes_topic = native_module.topic("tf_deformation_nodes");
 
     // Config parameters
     Config config;
@@ -480,10 +520,19 @@ int main(int argc, char** argv)
         fprintf(stderr, "  _global_map: %s\n", global_map_topic.c_str());
         fprintf(stderr, "  pose_graph: %s\n", pose_graph_topic.c_str());
         fprintf(stderr, "  loop_closure_event: %s\n", loop_closure_event_topic.c_str());
+        fprintf(stderr, "  tf_deformation_nodes: %s\n", deformation_nodes_topic.c_str());
     }
 
     double last_global_map_time = 0.0;
     int timer_period_ms = 50;  // 20 Hz, matching original
+
+    // Per-node deformation stream state. tf_id identifies the corrected edge
+    // (frame_id -> child_frame_id, e.g. map -> odom) so a multi-robot consumer can
+    // filter; ids/last_published persist a stable random id and last pose per keyframe.
+    uint64_t deformation_tf_id = dimos::tf_id_for(frame_id, child_frame_id);
+    std::mt19937_64 deformation_rng{std::random_device{}()};
+    std::vector<uint64_t> deformation_ids;
+    std::vector<std::pair<M3D, V3D>> deformation_last_published;
 
     while (g_running.load()) {
         // Drain all pending LCM messages
@@ -631,6 +680,12 @@ int main(int argc, char** argv)
         dimos::Graph3D pose_graph_msg = build_pose_graph(
             pgo.keyPoses(), pgo.historyPairs(), cur_time, frame_id);
         pose_graph_msg.publish(lcm, pose_graph_topic);
+
+        // Same keyframes, published individually so a recording can stream them
+        // (new + optimizer-moved nodes only).
+        publish_deformation_nodes(
+            lcm, deformation_nodes_topic, pgo.keyPoses(), deformation_tf_id, frame_id,
+            deformation_ids, deformation_last_published, deformation_rng);
 
         // Publish global map (throttled)
         double now = cur_time;
