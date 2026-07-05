@@ -16,6 +16,14 @@
 //     bytes  utf-8 (no terminator)
 //   7×double pose: pos_x, pos_y, pos_z, quat_x, quat_y, quat_z, quat_w  (from->to)
 //   36×double covariance: row-major 6x6, GTSAM Pose3 tangent order [rot(3), trans(3)]
+//   TAIL (absent on pre-consolidation payloads; decode tolerates either):
+//   for each of (map_id, kind):
+//     uint32 len
+//     bytes  utf-8 (no terminator)
+//
+// map_id names which map's frame system the observation lives in (multi-map
+// bridging; the single-graph PGO ignores it) and kind is a coarse category
+// defaulting python-side to the to_id URL scheme.
 //
 // This class exposes the minimal interface lcm-cpp's templated subscribe needs
 // (an instance decode(const void*, int, int)); it never encodes or publishes.
@@ -53,6 +61,8 @@ public:
     std::string to_id;                  // the BetweenFactor "to" (location variable id)
     std::string frame_id;               // the BetweenFactor "from" frame (== body frame)
     std::string constraint_instance_id; // external instance id, for revision/removal
+    std::string map_id;                 // whose frame system (multi-map); "" here
+    std::string kind;                   // coarse category (e.g. "apriltag", "reloc")
     double pos_x = 0.0, pos_y = 0.0, pos_z = 0.0;
     double quat_x = 0.0, quat_y = 0.0, quat_z = 0.0, quat_w = 1.0;
     double covariance[36] = {0.0};      // row-major 6x6, tangent order [rot, trans]
@@ -93,6 +103,21 @@ public:
             covariance[i] = location_constraint_detail::read_double_be(data + off + i * 8);
         }
         off += 36 * 8;
+
+        // Tail fields (map_id, kind): absent on pre-consolidation payloads —
+        // treat missing as "" rather than failing the decode.
+        std::string* tail_fields[2] = {&map_id, &kind};
+        for (auto* field : tail_fields) {
+            if (!need(4)) {
+                field->clear();
+                continue;
+            }
+            uint32_t len = location_constraint_detail::read_u32_be(data + off);
+            off += 4;
+            if (!need(static_cast<int>(len))) return -1;
+            field->assign(reinterpret_cast<const char*>(data + off), len);
+            off += static_cast<int>(len);
+        }
 
         return off - start;
     }
