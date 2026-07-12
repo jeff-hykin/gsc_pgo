@@ -109,33 +109,31 @@ struct Config
     double odom_trans_xy_var = 1e-4;  // x, y
     double odom_trans_z_var = 1e-6;   // z
 
-    // --- Gravity anchor ------------------------------------------------------
-    // The first keyframe's orientation is gravity-aligned by the LIO front end
-    // (initial roll/pitch is correct). The anchor is a PriorFactor on keyframe 0
-    // that pins it so the optimizer (pulled by landmark/loop factors) cannot
-    // rotate the initial pitch/roll away from gravity. The full pose is pinned
-    // (it is also the gauge reference); the roll/pitch stiffness is the gravity
-    // component and is exposed separately. Variances (smaller = stiffer).
-    bool gravity_anchor = true;
-    double gravity_anchor_rp_var = 1e-12;     // roll/pitch (the gravity lock)
-    double gravity_anchor_yaw_var = 1e-12;    // yaw (gauge)
-    double gravity_anchor_trans_var = 1e-12;  // translation (gauge)
+    // --- First-keyframe anchor prior -----------------------------------------
+    // The pose graph is relative-only, so one keyframe must be pinned to fix the
+    // gauge: a PriorFactor on keyframe 0. Each axis has its own stiffness (smaller
+    // variance = harder pin). The first keyframe's orientation is gravity-aligned
+    // by the LIO front end, so a tight anchor_rp_var pins roll/pitch to that
+    // attitude (loop/landmark factors cannot tilt the map); loosen it to let those
+    // factors decide roll/pitch. Yaw + translation stay stiff (they fix the gauge).
+    double anchor_rp_var = 1e-12;     // roll/pitch
+    double anchor_yaw_var = 1e-12;    // yaw (gauge)
+    double anchor_trans_var = 1e-12;  // translation (gauge)
 
-    // Per-keyframe gravity anchor. Anchoring gravity only on keyframe 0 is not
-    // enough: a large loop closure (correcting accumulated yaw) is free to slosh
-    // some of the correction into the *inner* keyframes' roll/pitch, because
-    // nothing else pins them — and a tilt converts horizontal travel into
-    // vertical, so the corrected z drifts wildly (tens of metres) even though the
-    // LIO front end's roll/pitch are gravity-accurate. This adds a roll/pitch-only
-    // PriorFactor on EVERY keyframe (target = the keyframe's gravity-aligned LIO
-    // orientation; yaw + translation left free for loop closure), so the closure
-    // corrects yaw/x-y only and the gravity-correct z structure is preserved.
-    // Default OFF: the anisotropic odometry between-factor (above) is the primary
-    // gravity-preservation mechanism and lets landmarks still correct slow tilt
-    // drift. This absolute prior is a harder lock — useful once the front end's
-    // absolute tilt is made trustworthy (e.g. by ZUPT in the LIO estimator).
-    bool gravity_anchor_per_keyframe = false;
-    double gravity_anchor_kf_rp_var = 1e-4;   // (~0.57 deg) roll/pitch stiffness
+    // Per-keyframe roll/pitch prior. Anchoring only keyframe 0 is not enough: a
+    // large loop closure (correcting accumulated yaw) is free to slosh some of the
+    // correction into the *inner* keyframes' roll/pitch, because nothing else pins
+    // them — and a tilt converts horizontal travel into vertical, so the corrected
+    // z drifts wildly (tens of metres) even though the LIO front end's roll/pitch
+    // are accurate. This adds a roll/pitch-only PriorFactor on EVERY keyframe
+    // (target = the keyframe's initial LIO orientation; yaw + translation left free
+    // for loop closure), so the closure corrects yaw/x-y only and the z structure
+    // is preserved. Default OFF: the anisotropic odometry between-factor (above) is
+    // the primary tilt-preservation mechanism and lets landmarks still correct slow
+    // tilt drift. This absolute prior is a harder lock — useful once the front
+    // end's absolute tilt is made trustworthy (e.g. by ZUPT in the LIO estimator).
+    bool per_keyframe_rp_prior = false;
+    double per_keyframe_rp_var = 1e-4;   // (~0.57 deg) roll/pitch stiffness
 
     // Scan Context settings
     bool use_scan_context = true;

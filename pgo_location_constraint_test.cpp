@@ -140,11 +140,12 @@ static void test_location_closure() {
           "location closure pulls the drifted end back to the true end by >50%");
 }
 
-// --- Test 2: the gravity anchor preserves the initial roll/pitch. Start with a
-// 30 deg pitch; after constraint-driven optimization, keyframe 0's pitch is kept.
+// --- Test 2: the first-keyframe anchor prior preserves the initial roll/pitch.
+// Start with a 30 deg pitch; after constraint-driven optimization, keyframe 0's
+// pitch is kept.
 static double pitch_deg(const M3D& r) { return std::asin(-r(2, 0)) * 180.0 / M_PI; }
 
-static void test_gravity_anchor() {
+static void test_anchor_prior() {
     Config cfg;
     cfg.use_location_constraints = true;
     cfg.key_pose_delta_trans = 0.5;
@@ -169,7 +170,7 @@ static void test_gravity_anchor() {
     double p_out = pitch_deg(pgo.keyPoses().front().r_global);
     fprintf(stderr, "   kf0 pitch in=%.4f out=%.4f deg\n", p_in, p_out);
     CHECK(std::abs(p_out - p_in) < 0.1,
-          "gravity anchor keeps kf0 pitch within 0.1 deg of input");
+          "anchor prior keeps kf0 pitch within 0.1 deg of input");
 }
 
 // --- Test 3: revision supersedes a stale (wrong) committed constraint factor.
@@ -214,19 +215,19 @@ static void test_revision() {
           "revision removes the stale wrong constraint -> cleaner closure than without");
 }
 
-// --- Test 4: the per-keyframe gravity anchor keeps EVERY keyframe level through a
-// loop closure (not just kf0). The keyframes drive on flat ground (zero
+// --- Test 4: the per-keyframe roll/pitch prior keeps EVERY keyframe level through
+// a loop closure (not just kf0). The keyframes drive on flat ground (zero
 // roll/pitch); after the location closure corrects the drift, no inner keyframe
 // should have tilted — tilt is what converts horizontal travel into vertical and
-// corrupts z. Compares anchor off vs on.
-static void test_per_keyframe_gravity() {
+// corrupts z. Compares the prior off vs on.
+static void test_per_keyframe_rp_prior() {
     const int K = 240;
     auto f = make_drifted_loop(K, 30.0, 0.0040);
     auto run = [&](bool per_kf) {
         Config cfg;
         cfg.use_location_constraints = true;
         cfg.key_pose_delta_trans = 0.5;
-        cfg.gravity_anchor_per_keyframe = per_kf;
+        cfg.per_keyframe_rp_prior = per_kf;
         SimplePGO pgo(cfg);
         for (int i = 0; i <= K; i++) {
             step(pgo, i * 0.1, f[i].odom_pos, yaw(f[i].odom_yaw));
@@ -240,18 +241,18 @@ static void test_per_keyframe_gravity() {
         return max_pitch;
     };
     double off = run(false), on = run(true);
-    fprintf(stderr, "   max |pitch| across keyframes: anchor off=%.2f deg, on=%.2f deg\n", off, on);
+    fprintf(stderr, "   max |pitch| across keyframes: prior off=%.2f deg, on=%.2f deg\n", off, on);
     CHECK(on < 0.5,
-          "per-keyframe gravity anchor keeps all keyframes level (<0.5 deg) through closure");
+          "per-keyframe roll/pitch prior keeps all keyframes level (<0.5 deg) through closure");
 }
 
 int main() {
     fprintf(stderr, "== test_location_closure ==\n");
     test_location_closure();
-    fprintf(stderr, "== test_gravity_anchor ==\n");
-    test_gravity_anchor();
-    fprintf(stderr, "== test_per_keyframe_gravity ==\n");
-    test_per_keyframe_gravity();
+    fprintf(stderr, "== test_anchor_prior ==\n");
+    test_anchor_prior();
+    fprintf(stderr, "== test_per_keyframe_rp_prior ==\n");
+    test_per_keyframe_rp_prior();
     fprintf(stderr, "== test_revision ==\n");
     test_revision();
     if (g_failures) {

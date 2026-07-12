@@ -115,18 +115,19 @@ size_t SimplePGO::insertPoseNode(const PoseWithTime &pose, CloudType::Ptr cloud,
     m_initial_values.insert(idx, gtsam::Pose3(gtsam::Rot3(init_r), gtsam::Point3(init_t)));
     if (idx == 0)
     {
-        // Gravity anchor / gauge prior on the first keyframe. Its orientation is
-        // gravity-aligned by the LIO front end; this prior pins it so landmark /
-        // loop closures cannot rotate the initial roll/pitch away from gravity.
-        // Pose3 tangent order is [rot(3), trans(3)]; the first two rotation
-        // components are roll/pitch (the gravity lock), the third is yaw (gauge).
+        // Absolute anchor prior on the first keyframe (always present: fixes the
+        // pose-graph gauge). Pose3 tangent order is [rot(3), trans(3)]; the first
+        // two rotation components are roll/pitch, the third is yaw. A tight
+        // anchor_rp_var pins roll/pitch to the initial (LIO, gravity-aligned)
+        // attitude so loop/landmark factors cannot tilt the map; a loose one frees
+        // it. Yaw + translation stay stiff, which is what fixes the gauge.
         gtsam::Vector6 prior_var;
-        prior_var << m_config.gravity_anchor_rp_var,
-                     m_config.gravity_anchor_rp_var,
-                     m_config.gravity_anchor_yaw_var,
-                     m_config.gravity_anchor_trans_var,
-                     m_config.gravity_anchor_trans_var,
-                     m_config.gravity_anchor_trans_var;
+        prior_var << m_config.anchor_rp_var,
+                     m_config.anchor_rp_var,
+                     m_config.anchor_yaw_var,
+                     m_config.anchor_trans_var,
+                     m_config.anchor_trans_var,
+                     m_config.anchor_trans_var;
         gtsam::noiseModel::Diagonal::shared_ptr noise =
             gtsam::noiseModel::Diagonal::Variances(prior_var);
         m_graph.add(gtsam::PriorFactor<gtsam::Pose3>(idx, gtsam::Pose3(gtsam::Rot3(init_r), gtsam::Point3(init_t)), noise));
@@ -144,15 +145,15 @@ size_t SimplePGO::insertPoseNode(const PoseWithTime &pose, CloudType::Ptr cloud,
              m_config.odom_trans_xy_var, m_config.odom_trans_z_var).finished());
         m_graph.add(gtsam::BetweenFactor<gtsam::Pose3>(idx - 1, idx, gtsam::Pose3(gtsam::Rot3(r_between), gtsam::Point3(t_between)), noise));
 
-        // Per-keyframe gravity anchor: pin this keyframe's roll/pitch to its
-        // gravity-aligned LIO orientation (init_r), leaving yaw + translation
-        // free (huge variance). Keeps a loop closure from tilting inner keyframes
-        // and corrupting z (see gravity_anchor_per_keyframe in simple_pgo.h).
-        if (m_config.gravity_anchor_per_keyframe)
+        // Per-keyframe roll/pitch prior: pin this keyframe's roll/pitch to its
+        // initial LIO orientation (init_r), leaving yaw + translation free (huge
+        // variance). Keeps a loop closure from tilting inner keyframes and
+        // corrupting z (see per_keyframe_rp_prior in simple_pgo.h).
+        if (m_config.per_keyframe_rp_prior)
         {
             gtsam::Vector6 grav_var;
-            grav_var << m_config.gravity_anchor_kf_rp_var,
-                        m_config.gravity_anchor_kf_rp_var,
+            grav_var << m_config.per_keyframe_rp_var,
+                        m_config.per_keyframe_rp_var,
                         1e8, 1e8, 1e8, 1e8;  // yaw + translation unconstrained
             gtsam::noiseModel::Diagonal::shared_ptr grav_noise =
                 gtsam::noiseModel::Diagonal::Variances(grav_var);

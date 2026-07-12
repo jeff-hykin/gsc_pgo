@@ -447,13 +447,13 @@ int main(int argc, char** argv)
     g_use_location_constraints = config.use_location_constraints;
     g_odom_buffer_window = native_module.arg_float("odom_buffer_window", 10.0f);
 
-    // Gravity anchor (fix the gravity-aligned initial roll/pitch on keyframe 0).
-    config.gravity_anchor = native_module.arg_bool("gravity_anchor", true);
-    config.gravity_anchor_rp_var = native_module.arg_float("gravity_anchor_rp_var", 1e-12f);
-    config.gravity_anchor_yaw_var = native_module.arg_float("gravity_anchor_yaw_var", 1e-12f);
-    config.gravity_anchor_trans_var = native_module.arg_float("gravity_anchor_trans_var", 1e-12f);
-    config.gravity_anchor_per_keyframe = native_module.arg_bool("gravity_anchor_per_keyframe", false);
-    config.gravity_anchor_kf_rp_var = native_module.arg_float("gravity_anchor_kf_rp_var", 1e-4f);
+    // First-keyframe anchor prior (per-axis stiffness; a tight anchor_rp_var pins
+    // the initial roll/pitch on keyframe 0) + optional per-keyframe roll/pitch prior.
+    config.anchor_rp_var = native_module.arg_float("anchor_rp_var", 1e-12f);
+    config.anchor_yaw_var = native_module.arg_float("anchor_yaw_var", 1e-12f);
+    config.anchor_trans_var = native_module.arg_float("anchor_trans_var", 1e-12f);
+    config.per_keyframe_rp_prior = native_module.arg_bool("per_keyframe_rp_prior", false);
+    config.per_keyframe_rp_var = native_module.arg_float("per_keyframe_rp_var", 1e-4f);
 
     // Anisotropic odometry between-factor (stiff roll/pitch, looser yaw) — see
     // simple_pgo.h. Preserves z by keeping loop closures from tilting the graph.

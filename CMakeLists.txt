@@ -49,7 +49,7 @@ target_link_directories(pgo PRIVATE
 
 install(TARGETS pgo DESTINATION bin)
 
-# Lockstep unit test for the location-constraint / gravity-anchor / revision
+# Lockstep unit test for the location-constraint / anchor-prior / revision
 # paths. It links the PGO sources and drives SimplePGO directly (no LCM runtime),
 # but still needs the generated message headers (simple_pgo.h pulls in PoseStamped).
 add_executable(pgo_location_constraint_test
